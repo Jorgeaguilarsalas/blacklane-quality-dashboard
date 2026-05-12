@@ -58,6 +58,46 @@ TIER_COLORS = {
     "D": COLOR_BAD,
 }
 
+
+def value_gradient(value: float, vmin: float, vmax: float, palette: str = "red") -> str:
+    """
+    Return a CSS background-color style for a numeric value, scaled vmin→vmax.
+    Replaces pandas.Styler.background_gradient() to avoid matplotlib dependency.
+
+    palette: 'red' (low=light, high=dark red), 'green' (low=light, high=dark green),
+             'blue' (low=light, high=dark blue).
+    """
+    if pd.isna(value):
+        return ""
+    # Normalize to [0, 1]
+    if vmax == vmin:
+        intensity = 0.5
+    else:
+        intensity = max(0.0, min(1.0, (value - vmin) / (vmax - vmin)))
+
+    # Two-stop interpolation: light tint → strong color
+    if palette == "red":
+        # #FEE2E2 (light red) → #991B1B (dark red)
+        r = int(254 + (153 - 254) * intensity)
+        g = int(226 + (27 - 226) * intensity)
+        b = int(226 + (27 - 226) * intensity)
+    elif palette == "green":
+        # #D1FAE5 (light green) → #065F46 (dark green)
+        r = int(209 + (6 - 209) * intensity)
+        g = int(250 + (95 - 250) * intensity)
+        b = int(229 + (70 - 229) * intensity)
+    elif palette == "blue":
+        # #DBEAFE (light blue) → #1E40AF (dark blue)
+        r = int(219 + (30 - 219) * intensity)
+        g = int(234 + (64 - 234) * intensity)
+        b = int(254 + (175 - 254) * intensity)
+    else:
+        return ""
+
+    # Pick text color for contrast: dark text on light bg, white on dark bg
+    text_color = "#1F2937" if intensity < 0.55 else "#FFFFFF"
+    return f"background-color: rgb({r},{g},{b}); color: {text_color};"
+
 # ============================================================
 # DATA LOADING + PREPARATION
 # ============================================================
@@ -682,9 +722,9 @@ with tab_scorecard:
                     "Rated %": "{:.1f}%",
                     "Avg ★": "{:.2f}",
                 })
-                .background_gradient(subset=["Cell B %"], cmap="Reds", vmin=0, vmax=20)
-                .background_gradient(subset=["€/ride"], cmap="Greens", vmin=-10, vmax=50)
-                .background_gradient(subset=["Rated %"], cmap="Blues", vmin=0, vmax=30),
+                .map(lambda v: value_gradient(v, 0, 20, "red"), subset=["Cell B %"])
+                .map(lambda v: value_gradient(v, -10, 50, "green"), subset=["€/ride"])
+                .map(lambda v: value_gradient(v, 0, 30, "blue"), subset=["Rated %"]),
             use_container_width=True,
             hide_index=True,
         )
@@ -870,7 +910,7 @@ with tab_chauffeurs:
                 "Cell B %": "{:.1f}%",
                 "Avg ★ (when rated)": "{:.2f}",
                 "Revenue (€)": "€{:,.0f}",
-            }).background_gradient(subset=["Cell B %"], cmap="Reds", vmin=10, vmax=80),
+            }).map(lambda v: value_gradient(v, 10, 80, "red"), subset=["Cell B %"]),
             use_container_width=True,
             hide_index=True,
         )
