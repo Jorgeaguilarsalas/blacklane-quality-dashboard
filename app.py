@@ -403,10 +403,11 @@ st.markdown(f"<div style='font-size: 11px; color: {COLOR_MUTED}; letter-spacing:
 # TABS
 # ============================================================
 
-tab_overview, tab_pillars, tab_scorecard, tab_telemetry, tab_chauffeurs = st.tabs([
+tab_overview, tab_pillars, tab_scorecard, tab_qac, tab_telemetry, tab_chauffeurs = st.tabs([
     "Overview",
     "Quality pillars",
     "LSP Scorecard",
+    "QAC calculator",
     "Operational telemetry",
     "Chauffeur audit",
 ])
@@ -882,6 +883,310 @@ with tab_scorecard:
                     showlegend=False,
                 )
                 st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================
+# TAB: QAC CALCULATOR
+# ============================================================
+
+with tab_qac:
+    section_header(
+        "QAC calculator",
+        "Quality-Adjusted Contribution per ride · Goal 3's north-star metric · interactive"
+    )
+
+    # Framing strip — what QAC is
+    st.markdown(
+        f"""
+        <div style="background: {COLOR_PANEL}; border-left: 4px solid {COLOR_GOOD}; padding: 14px 18px; border-radius: 3px; font-size: 13px; color: {COLOR_INK};">
+            <strong>QAC = (Avg. Gross Revenue − LSP Payout − Penalties) ÷ accepted rides.</strong>
+            The first two terms give gross contribution. Penalties are deductions for things that went wrong — they pull contribution down to reflect that a "completed" ride isn't always a quality ride. Today three penalty types are measurable on the existing data; refund and complaint penalties wait for Q6 wishlist data.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Compute gross contribution ──────────────────────────────
+    n_accepted = len(accepted)
+    n_finished = int(accepted["is_finished"].sum())
+    gross_revenue_total = float(accepted["Avg. Gross Revenue"].sum())
+    lsp_payout_total = float(accepted["Avg. Winning Price"].sum())
+    gross_contribution_total = gross_revenue_total - lsp_payout_total
+    gross_per_ride = gross_contribution_total / n_accepted if n_accepted else 0
+
+    # ── Headline: gross vs penalised ─────────────────────────────
+    section_header("Gross contribution baseline", "Before any quality penalties applied — the unsoftened number")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi_card("GROSS REVENUE", f"€{gross_revenue_total:,.0f}", f"{n_accepted:,} accepted rides")
+    with c2:
+        kpi_card("LSP PAYOUT", f"€{lsp_payout_total:,.0f}", "Paid to LSPs")
+    with c3:
+        kpi_card("GROSS CONTRIBUTION", f"€{gross_contribution_total:,.0f}", "Revenue minus payout")
+    with c4:
+        kpi_card("GROSS QAC / RIDE", f"€{gross_per_ride:.2f}", "Per accepted ride · the €32.10 baseline", color=COLOR_GOOD)
+
+    # ── Penalty calculators ──────────────────────────────────────
+    section_header(
+        "Penalty calculator · three buckets we can compute today",
+        "Each slider sets the assumed cost-per-event · the totals update live · sanity-check the sensitivity"
+    )
+
+    st.caption(
+        "Honest framing: cost-per-event values are panel-configurable. Defaults reflect a reasonable industry prior. "
+        "Once Q6 data lands (refund events, complaint records), penalties become measured rather than approximated."
+    )
+
+    # Penalty 1: No-show
+    st.write("")
+    cellB_subset = accepted[accepted["is_cell_b"]]
+    n_cellB = len(cellB_subset)
+    no_show_revenue_at_risk = float(cellB_subset["Avg. Gross Revenue"].sum())
+
+    pc1, pc2 = st.columns([1, 2])
+    with pc1:
+        st.markdown(
+            f"""
+            <div style="background: {COLOR_BG}; border: 1px solid #E5E7EB; border-left: 4px solid {COLOR_BAD}; padding: 14px 16px; border-radius: 4px;">
+                <div style="font-size: 11px; color: {COLOR_BAD}; letter-spacing: 1px; font-weight: 700;">PENALTY 1 · NO-SHOW</div>
+                <div style="font-size: 14px; font-weight: 600; color: {COLOR_INK}; margin-top: 6px;">Cell B events</div>
+                <div style="font-size: 11px; color: {COLOR_MUTED}; margin-top: 4px;">Chauffeur arrived, customer didn't connect. Revenue collected from customer is a fraction of LSP payout — net loss per event.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with pc2:
+        st.markdown(f"**Events**: {n_cellB:,} Cell B no-shows · **Revenue at risk**: €{no_show_revenue_at_risk:,.0f}")
+        st.caption("Penalty model: use the gross revenue-at-risk as the penalty (i.e. count the failed-ride revenue as a quality cost, since the customer experience was lost).")
+        no_show_multiplier = st.slider(
+            "Severity multiplier (1.0 = revenue-at-risk · 2.0 = double-weight for brand cost)",
+            min_value=0.5, max_value=3.0, value=1.0, step=0.1, key="no_show_mult",
+        )
+    no_show_penalty_total = no_show_revenue_at_risk * no_show_multiplier
+    no_show_penalty_per_ride = no_show_penalty_total / n_accepted if n_accepted else 0
+
+    # Penalty 2: Late arrival (>15 min)
+    st.write("")
+    late_subset = accepted[accepted["pickup_delta_min"] > 15]
+    n_late = len(late_subset)
+
+    pc1, pc2 = st.columns([1, 2])
+    with pc1:
+        st.markdown(
+            f"""
+            <div style="background: {COLOR_BG}; border: 1px solid #E5E7EB; border-left: 4px solid {COLOR_WARN}; padding: 14px 16px; border-radius: 4px;">
+                <div style="font-size: 11px; color: {COLOR_WARN}; letter-spacing: 1px; font-weight: 700;">PENALTY 2 · LATE ARRIVAL</div>
+                <div style="font-size: 14px; font-weight: 600; color: {COLOR_INK}; margin-top: 6px;">Pickup &gt; 15 min late</div>
+                <div style="font-size: 11px; color: {COLOR_MUTED}; margin-top: 4px;">Operational reliability breach. Customer felt the delay; partnership integrity erodes when chauffeur is meaningfully late.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with pc2:
+        st.markdown(f"**Events**: {n_late:,} rides &gt;15 min late vs booked pickup time")
+        st.caption("Penalty model: assume a fixed euro deduction per late-arrival event. Default €10 reflects a modest brand-cost approximation.")
+        late_cost_per_event = st.slider(
+            "Cost per late event (€)",
+            min_value=0, max_value=50, value=10, step=5, key="late_cost",
+        )
+    late_penalty_total = n_late * late_cost_per_event
+    late_penalty_per_ride = late_penalty_total / n_accepted if n_accepted else 0
+
+    # Penalty 3: Low rating
+    st.write("")
+    rated_subset = accepted[accepted["Avg. Driver Rating"].notna()]
+    low_rated = rated_subset[rated_subset["Avg. Driver Rating"] < 5]
+    n_rated = len(rated_subset)
+    n_low_rated = len(low_rated)
+
+    pc1, pc2 = st.columns([1, 2])
+    with pc1:
+        st.markdown(
+            f"""
+            <div style="background: {COLOR_BG}; border: 1px solid #E5E7EB; border-left: 4px solid {COLOR_INK}; padding: 14px 16px; border-radius: 4px;">
+                <div style="font-size: 11px; color: {COLOR_INK}; letter-spacing: 1px; font-weight: 700;">PENALTY 3 · LOW RATING</div>
+                <div style="font-size: 14px; font-weight: 600; color: {COLOR_INK}; margin-top: 6px;">Rated &lt; 5 stars</div>
+                <div style="font-size: 11px; color: {COLOR_MUTED}; margin-top: 4px;">Customer-reported quality failure. Rating coverage is only 17% so the signal is thin — penalty here is conservative.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with pc2:
+        rated_coverage_pct = 100 * n_rated / n_finished if n_finished else 0
+        st.markdown(f"**Events**: {n_low_rated:,} rides rated below 5 (out of {n_rated:,} rated · coverage {rated_coverage_pct:.1f}%)")
+        st.caption("Penalty model: assume a euro deduction per low-rating event. Default €25 because each customer-reported dissatisfaction is a high-conviction quality signal — but coverage bias means we only see ~17% of trips.")
+        low_rating_cost_per_event = st.slider(
+            "Cost per low-rating event (€)",
+            min_value=0, max_value=100, value=25, step=5, key="low_rating_cost",
+        )
+    low_rating_penalty_total = n_low_rated * low_rating_cost_per_event
+    low_rating_penalty_per_ride = low_rating_penalty_total / n_accepted if n_accepted else 0
+
+    # ── Penalised QAC headline ───────────────────────────────────
+    section_header("Penalised QAC — gross minus penalties", "What the metric actually says about quality-weighted contribution")
+
+    total_penalties = no_show_penalty_total + late_penalty_total + low_rating_penalty_total
+    total_penalty_per_ride = total_penalties / n_accepted if n_accepted else 0
+    penalised_qac = gross_per_ride - total_penalty_per_ride
+    target_qac = gross_per_ride * 1.08
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi_card("GROSS QAC", f"€{gross_per_ride:.2f}", "Per ride · before penalties", color=COLOR_GOOD)
+    with c2:
+        kpi_card("TOTAL PENALTY DRAG", f"€{total_penalty_per_ride:.2f}", f"€{total_penalties:,.0f} across {n_accepted:,} rides", color=COLOR_BAD)
+    with c3:
+        kpi_card("PENALISED QAC", f"€{penalised_qac:.2f}", "Per ride · after all penalties", color=COLOR_WARN)
+    with c4:
+        kpi_card("+8% TARGET", f"€{target_qac:.2f}", "Goal 3 target on gross baseline", color=COLOR_GOOD)
+
+    # ── Waterfall visualization ───────────────────────────────────
+    section_header("Waterfall — building QAC step by step", "Visual decomposition of the per-ride economics")
+
+    waterfall_data = {
+        "label": [
+            "Gross revenue<br>per ride",
+            "− LSP payout",
+            "Gross contribution",
+            "− No-show penalty",
+            "− Late-arrival penalty",
+            "− Low-rating penalty",
+            "Penalised QAC<br>per ride",
+        ],
+        "value": [
+            gross_revenue_total / n_accepted,
+            -lsp_payout_total / n_accepted,
+            None,  # total marker
+            -no_show_penalty_per_ride,
+            -late_penalty_per_ride,
+            -low_rating_penalty_per_ride,
+            None,  # total marker
+        ],
+        "measure": ["absolute", "relative", "total", "relative", "relative", "relative", "total"],
+    }
+
+    fig = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=waterfall_data["measure"],
+        x=waterfall_data["label"],
+        y=waterfall_data["value"],
+        text=[
+            f"€{gross_revenue_total/n_accepted:.2f}",
+            f"−€{lsp_payout_total/n_accepted:.2f}",
+            f"€{gross_per_ride:.2f}",
+            f"−€{no_show_penalty_per_ride:.2f}",
+            f"−€{late_penalty_per_ride:.2f}",
+            f"−€{low_rating_penalty_per_ride:.2f}",
+            f"€{penalised_qac:.2f}",
+        ],
+        textposition="outside",
+        connector={"line": {"color": COLOR_MUTED}},
+        increasing={"marker": {"color": COLOR_GOOD}},
+        decreasing={"marker": {"color": COLOR_BAD}},
+        totals={"marker": {"color": COLOR_INK}},
+    ))
+    fig.update_layout(
+        height=430,
+        margin=dict(l=40, r=20, t=20, b=80),
+        yaxis=dict(title="€ per ride", showgrid=True, gridcolor="#E5E7EB"),
+        plot_bgcolor=COLOR_BG, paper_bgcolor=COLOR_BG,
+        font=dict(family="system-ui", color=COLOR_INK, size=11),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Per-LSP QAC breakdown ─────────────────────────────────────
+    section_header("QAC per LSP", "Operational accountability — which LSPs deliver best quality-adjusted contribution")
+
+    # Build per-LSP QAC
+    lsp_qac = accepted.groupby("LSP Name").agg(
+        rides=("Avg. Gross Revenue", "size"),
+        gross_revenue=("Avg. Gross Revenue", "sum"),
+        lsp_payout=("Avg. Winning Price", "sum"),
+        cell_b_revenue=("Avg. Gross Revenue", lambda s: s[accepted.loc[s.index, "is_cell_b"]].sum()),
+        n_cell_b=("is_cell_b", "sum"),
+        n_late=("pickup_delta_min", lambda s: int((s > 15).sum())),
+        n_low_rated=("Avg. Driver Rating", lambda s: int((s < 5).sum())),
+    ).reset_index()
+
+    lsp_qac["gross_contribution"] = lsp_qac["gross_revenue"] - lsp_qac["lsp_payout"]
+    lsp_qac["gross_per_ride"] = lsp_qac["gross_contribution"] / lsp_qac["rides"]
+    lsp_qac["penalty_total"] = (
+        lsp_qac["cell_b_revenue"] * no_show_multiplier
+        + lsp_qac["n_late"] * late_cost_per_event
+        + lsp_qac["n_low_rated"] * low_rating_cost_per_event
+    )
+    lsp_qac["penalty_per_ride"] = lsp_qac["penalty_total"] / lsp_qac["rides"]
+    lsp_qac["penalised_qac"] = lsp_qac["gross_per_ride"] - lsp_qac["penalty_per_ride"]
+
+    # Filter to LSPs with enough volume
+    lsp_qac = lsp_qac[lsp_qac["rides"] >= 100].sort_values("penalised_qac", ascending=False)
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        # Top 15 LSPs by penalised QAC
+        top_lsps = lsp_qac.head(15).sort_values("penalised_qac", ascending=True)
+        fig = go.Figure()
+        fig.add_bar(
+            y=top_lsps["LSP Name"].str[:24],
+            x=top_lsps["penalised_qac"],
+            orientation="h",
+            marker_color=[COLOR_GOOD if v > gross_per_ride else COLOR_WARN for v in top_lsps["penalised_qac"]],
+            text=[f"€{v:.2f}" for v in top_lsps["penalised_qac"]],
+            textposition="outside",
+            hovertemplate="<b>%{y}</b><br>Penalised QAC: €%{x:.2f}<br>Rides: %{customdata:,}<extra></extra>",
+            customdata=top_lsps["rides"],
+        )
+        fig.add_vline(x=gross_per_ride, line_dash="dash", line_color=COLOR_INK, opacity=0.5, annotation_text=f"Platform avg gross €{gross_per_ride:.2f}")
+        fig.update_layout(
+            title="<b>Top 15 LSPs by penalised QAC per ride</b>",
+            height=520,
+            margin=dict(l=160, r=80, t=40, b=20),
+            xaxis=dict(title="Penalised QAC per ride (€)", showgrid=True, gridcolor="#E5E7EB"),
+            plot_bgcolor=COLOR_BG, paper_bgcolor=COLOR_BG,
+            font=dict(family="system-ui", color=COLOR_INK),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        # Bottom 10 LSPs — biggest QAC drag
+        bottom_lsps = lsp_qac.tail(10).sort_values("penalised_qac", ascending=False)
+        fig = go.Figure()
+        fig.add_bar(
+            y=bottom_lsps["LSP Name"].str[:24],
+            x=bottom_lsps["penalty_per_ride"],
+            orientation="h",
+            marker_color=COLOR_BAD,
+            text=[f"−€{v:.2f}" for v in bottom_lsps["penalty_per_ride"]],
+            textposition="outside",
+            hovertemplate="<b>%{y}</b><br>Penalty drag: €%{x:.2f}/ride<br>Rides: %{customdata:,}<extra></extra>",
+            customdata=bottom_lsps["rides"],
+        )
+        fig.update_layout(
+            title="<b>10 LSPs with largest penalty drag</b>",
+            height=520,
+            margin=dict(l=160, r=60, t=40, b=20),
+            xaxis=dict(title="Penalty per ride (€)", showgrid=True, gridcolor="#E5E7EB"),
+            plot_bgcolor=COLOR_BG, paper_bgcolor=COLOR_BG,
+            font=dict(family="system-ui", color=COLOR_INK),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Honest caveats ────────────────────────────────────────────
+    st.markdown(
+        f"""
+        <div style="background: {COLOR_PANEL}; border-left: 4px solid {COLOR_WARN}; padding: 14px 18px; border-radius: 3px; margin-top: 20px;">
+            <div style="font-size: 12px; font-weight: 600; color: {COLOR_WARN}; letter-spacing: 1px;">WHAT TODAY'S QAC IS HONEST ABOUT</div>
+            <div style="font-size: 13px; color: {COLOR_INK}; margin-top: 8px; line-height: 1.6;">
+                <strong>Measurable now:</strong> No-show events (Cell B revenue-at-risk), late arrivals (pickup &gt;15 min past booked time), low-rating events (rated &lt;5 stars, with 17% coverage caveat).<br>
+                <strong>Waiting on Q6 data:</strong> Refund events (no field in dataset), complaint volume (no feed), class-of-service mismatch (only delivered class is recorded), airline-side VIP NPS (partnership data).<br>
+                <strong>Field-definition uncertainty:</strong> Whether Avg. Gross Revenue and Avg. Winning Price on no-show events reflect post-event settlement amounts is the first-week finance call. The penalty model assumes they do; if not, the no-show penalty magnitude shifts.<br>
+                <strong>Approximation, not measurement:</strong> Cost-per-event values are panel-configurable defaults, not measured costs. The sliders let you sanity-check sensitivity. Once refund and complaint data land, penalties become measured numbers tied to specific events.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ============================================================
 # TAB: OPERATIONAL TELEMETRY
