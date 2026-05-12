@@ -124,7 +124,35 @@ def load_data(uploaded_bytes: bytes | None, fallback_path: str | None) -> tuple[
     accepted["finished_dt"] = pd.to_datetime(accepted["Finished at local time"], errors="coerce")
     accepted["booking_dt"] = pd.to_datetime(accepted["Booking Date Local Time"], errors="coerce")
     accepted["ride_dt"] = pd.to_datetime(accepted["Ride Date Local Time"], errors="coerce")
+    accepted["accepted_dt"] = pd.to_datetime(accepted["Accepted At Local Time"], errors="coerce")
     accepted["date"] = accepted["pickup_dt"].dt.date
+
+    # Operational telemetry — derived signals
+    # Pickup arrival delta: chauffeur arrival minus booked pickup time, in minutes.
+    # Negative = early (good); positive = late.
+    mask = accepted["pickup_dt"].notna() & accepted["ride_dt"].notna()
+    accepted.loc[mask, "pickup_delta_min"] = (
+        (accepted.loc[mask, "pickup_dt"] - accepted.loc[mask, "ride_dt"]).dt.total_seconds() / 60
+    )
+
+    # Booking-to-acceptance latency: time between booking and an LSP claiming it (seconds).
+    mask = accepted["accepted_dt"].notna() & accepted["booking_dt"].notna()
+    accepted.loc[mask, "ba_latency_sec"] = (
+        (accepted.loc[mask, "accepted_dt"] - accepted.loc[mask, "booking_dt"]).dt.total_seconds()
+    )
+
+    # Lead time at booking: hours between booking and scheduled ride.
+    mask = accepted["ride_dt"].notna() & accepted["booking_dt"].notna()
+    accepted.loc[mask, "lead_time_hr"] = (
+        (accepted.loc[mask, "ride_dt"] - accepted.loc[mask, "booking_dt"]).dt.total_seconds() / 3600
+    )
+
+    # Trip duration (hours) and speed (km/h)
+    mask = accepted["finished_dt"].notna() & accepted["pickup_dt"].notna()
+    accepted.loc[mask, "trip_hr"] = (
+        (accepted.loc[mask, "finished_dt"] - accepted.loc[mask, "pickup_dt"]).dt.total_seconds() / 3600
+    )
+    accepted["speed_kmh"] = accepted["Route Distance KM"] / accepted["trip_hr"]
 
     # Derived classification flags
     accepted["has_pickup_ts"] = accepted["Pickup at local time"].notna()
@@ -375,10 +403,11 @@ st.markdown(f"<div style='font-size: 11px; color: {COLOR_MUTED}; letter-spacing:
 # TABS
 # ============================================================
 
-tab_overview, tab_pillars, tab_scorecard, tab_chauffeurs = st.tabs([
+tab_overview, tab_pillars, tab_scorecard, tab_telemetry, tab_chauffeurs = st.tabs([
     "Overview",
     "Quality pillars",
     "LSP Scorecard",
+    "Operational telemetry",
     "Chauffeur audit",
 ])
 
@@ -853,6 +882,328 @@ with tab_scorecard:
                     showlegend=False,
                 )
                 st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================
+# TAB: OPERATIONAL TELEMETRY
+# ============================================================
+
+with tab_telemetry:
+    section_header(
+        "Operational telemetry",
+        "Measure customer experience directly — without asking the customer anything"
+    )
+
+    st.markdown(
+        f"""
+        <div style="background: {COLOR_PANEL}; border-left: 4px solid {COLOR_INK}; padding: 10px 14px; border-radius: 3px; font-size: 12px; color: {COLOR_INK};">
+            Premium service brands measure quality through operational signals the system already generates, not by extracting time from customers. The four signals below proxy customer experience directly from existing timestamp and route fields — no new data required.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Signal 1: Pickup arrival delta ──────────────────────────────
+    section_header(
+        "1 · Pickup arrival delta",
+        "Chauffeur arrival vs booked pickup time · negative = early · the cleanest reliability metric"
+    )
+
+    pd_data = accepted[accepted["pickup_delta_min"].notna() & accepted["pickup_delta_min"].between(-60, 60)].copy()
+
+    if len(pd_data) > 0:
+        c1, c2, c3, c4 = st.columns(4)
+        median_delta = pd_data["pickup_delta_min"].median()
+        on_time_pct = 100 * pd_data["pickup_delta_min"].between(-1, 5).mean()
+        late_pct = 100 * (pd_data["pickup_delta_min"] > 5).mean()
+        very_late_pct = 100 * (pd_data["pickup_delta_min"] > 15).mean()
+
+        with c1:
+            kpi_card("MEDIAN ARRIVAL", f"{median_delta:.0f} min", "Early = premium service behavior", color=COLOR_GOOD if median_delta < 0 else COLOR_WARN)
+        with c2:
+            kpi_card("ON-TIME (-1 to +5 min)", f"{on_time_pct:.1f}%", "Window of acceptable variance", color=COLOR_GOOD)
+        with c3:
+            kpi_card("LATE > 5 MIN", f"{late_pct:.1f}%", "Operational reliability tail", color=COLOR_WARN if late_pct < 15 else COLOR_BAD)
+        with c4:
+            kpi_card("VERY LATE > 15 MIN", f"{very_late_pct:.1f}%", "Customer-visible failure tier", color=COLOR_BAD)
+
+        # Distribution histogram
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            fig = go.Figure()
+            fig.add_histogram(
+                x=pd_data["pickup_delta_min"],
+                nbinsx=40,
+                marker_color=COLOR_INK,
+                marker_line_color=COLOR_BG,
+                marker_line_width=1,
+            )
+            fig.add_vline(x=0, line_dash="solid", line_color=COLOR_BAD, opacity=0.6)
+            fig.add_vline(x=5, line_dash="dash", line_color=COLOR_WARN, opacity=0.6)
+            fig.update_layout(
+                title="<b>Distribution (minutes vs booked pickup)</b>",
+                height=320,
+                margin=dict(l=40, r=20, t=40, b=40),
+                xaxis=dict(title="Minutes (negative = early, positive = late)", showgrid=True, gridcolor="#E5E7EB"),
+                yaxis=dict(title="Rides"),
+                plot_bgcolor=COLOR_BG, paper_bgcolor=COLOR_BG,
+                font=dict(family="system-ui", color=COLOR_INK),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with c2:
+            # Per-city breakdown
+            by_city = pd_data.groupby("Ride Bd").agg(
+                rides=("pickup_delta_min", "size"),
+                median_delta=("pickup_delta_min", "median"),
+                late_pct=("pickup_delta_min", lambda s: 100 * (s > 5).mean()),
+            ).reset_index()
+            by_city = by_city[by_city["rides"] >= 50].sort_values("late_pct", ascending=True)
+
+            fig = go.Figure()
+            colors = [COLOR_BAD if r > 10 else (COLOR_WARN if r > 5 else COLOR_GOOD) for r in by_city["late_pct"]]
+            fig.add_bar(
+                y=by_city["Ride Bd"],
+                x=by_city["late_pct"],
+                orientation="h",
+                marker_color=colors,
+                text=[f"{v:.1f}%" for v in by_city["late_pct"]],
+                textposition="outside",
+                hovertemplate="<b>%{y}</b><br>Late >5 min: %{x:.1f}%<br>Rides: %{customdata:,}<extra></extra>",
+                customdata=by_city["rides"],
+            )
+            fig.update_layout(
+                title="<b>Share of rides arriving >5 min late, by city</b>",
+                height=320,
+                margin=dict(l=80, r=30, t=40, b=20),
+                xaxis=dict(title="% rides late >5 min", showgrid=True, gridcolor="#E5E7EB"),
+                plot_bgcolor=COLOR_BG, paper_bgcolor=COLOR_BG,
+                font=dict(family="system-ui", color=COLOR_INK),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No timestamp data available for pickup-delta analysis in current filter.")
+
+    # ── Signal 2: Booking-to-acceptance latency ─────────────────────
+    section_header(
+        "2 · Booking-to-acceptance latency",
+        "Time between booking and an LSP claiming it · supply-tightness indicator"
+    )
+
+    bl_data = accepted[accepted["ba_latency_sec"].notna() & accepted["ba_latency_sec"].between(0, 86400)].copy()
+    if len(bl_data) > 0:
+        c1, c2, c3, c4 = st.columns(4)
+        median_sec = bl_data["ba_latency_sec"].median()
+        instant_pct = 100 * (bl_data["ba_latency_sec"] < 60).mean()
+        fast_pct = 100 * (bl_data["ba_latency_sec"] < 300).mean()
+        slow_pct = 100 * (bl_data["ba_latency_sec"] > 3600).mean()
+
+        with c1:
+            kpi_card("MEDIAN LATENCY", f"{median_sec/60:.1f} min", f"{median_sec:.0f} seconds")
+        with c2:
+            kpi_card("INSTANT (<60s)", f"{instant_pct:.1f}%", "Pre-assigned or hot supply", color=COLOR_GOOD)
+        with c3:
+            kpi_card("FAST (<5 min)", f"{fast_pct:.1f}%", "Healthy supply response")
+        with c4:
+            kpi_card("SLOW (>1 hour)", f"{slow_pct:.1f}%", "Supply-side latency tail", color=COLOR_BAD if slow_pct > 20 else COLOR_WARN)
+
+        # Latency categories per city
+        bl_data["category"] = pd.cut(
+            bl_data["ba_latency_sec"],
+            bins=[0, 60, 300, 1800, 3600, 86400],
+            labels=["<1 min", "1-5 min", "5-30 min", "30-60 min", ">1 hour"],
+            include_lowest=True,
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            cat_share = bl_data["category"].value_counts(normalize=True).sort_index() * 100
+            fig = go.Figure()
+            colors = [COLOR_GOOD, "#0E7490", COLOR_MUTED, COLOR_WARN, COLOR_BAD]
+            fig.add_bar(
+                x=cat_share.index.astype(str),
+                y=cat_share.values,
+                marker_color=colors,
+                text=[f"{v:.1f}%" for v in cat_share.values],
+                textposition="outside",
+            )
+            fig.update_layout(
+                title="<b>Acceptance-latency distribution</b>",
+                height=320,
+                margin=dict(l=40, r=20, t=40, b=40),
+                xaxis=dict(title=""),
+                yaxis=dict(title="Share of bookings (%)"),
+                plot_bgcolor=COLOR_BG, paper_bgcolor=COLOR_BG,
+                font=dict(family="system-ui", color=COLOR_INK),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with c2:
+            # Per-LSP latency (top 10 by volume)
+            lsp_latency = bl_data.groupby("LSP Name").agg(
+                rides=("ba_latency_sec", "size"),
+                median_sec=("ba_latency_sec", "median"),
+                slow_share=("ba_latency_sec", lambda s: 100 * (s > 3600).mean()),
+            ).reset_index()
+            lsp_latency = lsp_latency[lsp_latency["rides"] >= 500].sort_values("rides", ascending=False).head(10)
+            lsp_latency = lsp_latency.sort_values("median_sec", ascending=True)
+            lsp_latency["median_min"] = lsp_latency["median_sec"] / 60
+
+            fig = go.Figure()
+            fig.add_bar(
+                y=lsp_latency["LSP Name"].str[:24],
+                x=lsp_latency["median_min"],
+                orientation="h",
+                marker_color=[COLOR_BAD if v > 30 else (COLOR_WARN if v > 10 else COLOR_GOOD) for v in lsp_latency["median_min"]],
+                text=[f"{v:.0f} min" for v in lsp_latency["median_min"]],
+                textposition="outside",
+                hovertemplate="<b>%{y}</b><br>Median latency: %{x:.1f} min<br>Rides: %{customdata:,}<extra></extra>",
+                customdata=lsp_latency["rides"],
+            )
+            fig.update_layout(
+                title="<b>Median acceptance latency, top 10 LSPs</b>",
+                height=320,
+                margin=dict(l=160, r=30, t=40, b=20),
+                xaxis=dict(title="Minutes", showgrid=True, gridcolor="#E5E7EB"),
+                plot_bgcolor=COLOR_BG, paper_bgcolor=COLOR_BG,
+                font=dict(family="system-ui", color=COLOR_INK),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ── Signal 3: Lead time at booking ──────────────────────────────
+    section_header(
+        "3 · Lead-time distribution",
+        "How far in advance customers book · short-lead is operationally hardest · direct link to Goal 2"
+    )
+
+    lt_data = accepted[accepted["lead_time_hr"].notna() & accepted["lead_time_hr"].between(0, 168)].copy()
+    if len(lt_data) > 0:
+        c1, c2, c3, c4 = st.columns(4)
+        median_lt = lt_data["lead_time_hr"].median()
+        short_pct = 100 * (lt_data["lead_time_hr"] < 2).mean()
+        same_day = 100 * (lt_data["lead_time_hr"] < 24).mean()
+        advance = 100 * (lt_data["lead_time_hr"] >= 24).mean()
+
+        with c1:
+            kpi_card("MEDIAN LEAD TIME", f"{median_lt:.0f} hours", f"{median_lt/24:.1f} days")
+        with c2:
+            kpi_card("SHORT LEAD (<2h)", f"{short_pct:.1f}%", "Goal 2's target segment", color=COLOR_BAD)
+        with c3:
+            kpi_card("SAME-DAY (<24h)", f"{same_day:.0f}%", "Within-day booking")
+        with c4:
+            kpi_card("ADVANCE (≥24h)", f"{advance:.0f}%", "Pre-planned bookings", color=COLOR_GOOD)
+
+        # Short-lead acceptance by city — directly relevant to Goal 2
+        short_lead = lt_data[lt_data["lead_time_hr"] < 2].copy()
+        if len(short_lead) > 0:
+            short_by_city = short_lead.groupby("Ride Bd").agg(
+                short_lead_count=("lead_time_hr", "size"),
+                finished=("is_finished", "sum"),
+            ).reset_index()
+            short_by_city["finish_rate"] = 100 * short_by_city["finished"] / short_by_city["short_lead_count"]
+            short_by_city = short_by_city[short_by_city["short_lead_count"] >= 20].sort_values("finish_rate", ascending=True)
+
+            if len(short_by_city) > 0:
+                fig = go.Figure()
+                colors = [COLOR_BAD if v < 90 else (COLOR_WARN if v < 95 else COLOR_GOOD) for v in short_by_city["finish_rate"]]
+                fig.add_bar(
+                    y=short_by_city["Ride Bd"],
+                    x=short_by_city["finish_rate"],
+                    orientation="h",
+                    marker_color=colors,
+                    text=[f"{v:.1f}%" for v in short_by_city["finish_rate"]],
+                    textposition="outside",
+                    hovertemplate="<b>%{y}</b><br>Short-lead finish rate: %{x:.1f}%<br>Short-lead rides: %{customdata:,}<extra></extra>",
+                    customdata=short_by_city["short_lead_count"],
+                )
+                fig.add_vline(x=98, line_dash="dash", line_color=COLOR_GOOD, opacity=0.6, annotation_text="Goal 2 target: 98%")
+                fig.update_layout(
+                    title="<b>Short-lead (<2h) completion rate by city · Goal 2's KPI target</b>",
+                    height=400,
+                    margin=dict(l=80, r=30, t=50, b=20),
+                    xaxis=dict(title="Completion rate (%)", showgrid=True, gridcolor="#E5E7EB", range=[80, 102]),
+                    plot_bgcolor=COLOR_BG, paper_bgcolor=COLOR_BG,
+                    font=dict(family="system-ui", color=COLOR_INK),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+    # ── Signal 4: Trip speed (route-type proxy) ─────────────────────
+    section_header(
+        "4 · Trip speed · route-type signal",
+        "Route Distance KM ÷ trip duration · reveals airport long-haul vs city short-haul mix"
+    )
+
+    sp_data = accepted[
+        accepted["speed_kmh"].notna() & accepted["speed_kmh"].between(1, 200) & (accepted["trip_hr"] > 0.1)
+    ].copy()
+    if len(sp_data) > 0:
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            fig = go.Figure()
+            fig.add_histogram(
+                x=sp_data["speed_kmh"],
+                nbinsx=40,
+                marker_color=COLOR_INK,
+                marker_line_color=COLOR_BG,
+                marker_line_width=1,
+            )
+            fig.update_layout(
+                title="<b>Trip-speed distribution (km/h)</b>",
+                height=320,
+                margin=dict(l=40, r=20, t=40, b=40),
+                xaxis=dict(title="km/h", showgrid=True, gridcolor="#E5E7EB"),
+                yaxis=dict(title="Rides"),
+                plot_bgcolor=COLOR_BG, paper_bgcolor=COLOR_BG,
+                font=dict(family="system-ui", color=COLOR_INK),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with c2:
+            speed_by_city = sp_data.groupby("Ride Bd").agg(
+                rides=("speed_kmh", "size"),
+                median_speed=("speed_kmh", "median"),
+                median_km=("Route Distance KM", "median"),
+            ).reset_index()
+            speed_by_city = speed_by_city[speed_by_city["rides"] >= 50].sort_values("median_speed", ascending=True)
+
+            fig = go.Figure()
+            fig.add_bar(
+                y=speed_by_city["Ride Bd"],
+                x=speed_by_city["median_speed"],
+                orientation="h",
+                marker_color=[
+                    COLOR_BAD if v < 15 else ("#0E7490" if v < 25 else COLOR_GOOD)
+                    for v in speed_by_city["median_speed"]
+                ],
+                text=[f"{v:.0f} km/h · median {k:.0f} km" for v, k in zip(speed_by_city["median_speed"], speed_by_city["median_km"])],
+                textposition="outside",
+                hovertemplate="<b>%{y}</b><br>Median speed: %{x:.1f} km/h<br>Median trip: %{customdata:.0f} km<extra></extra>",
+                customdata=speed_by_city["median_km"],
+            )
+            fig.update_layout(
+                title="<b>Median trip speed by city · low speed = city-center, high = airport routes</b>",
+                height=320,
+                margin=dict(l=80, r=180, t=40, b=20),
+                xaxis=dict(title="km/h", showgrid=True, gridcolor="#E5E7EB"),
+                plot_bgcolor=COLOR_BG, paper_bgcolor=COLOR_BG,
+                font=dict(family="system-ui", color=COLOR_INK),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Closing framing
+    st.markdown(
+        f"""
+        <div style="background: {COLOR_PANEL}; border-left: 4px solid {COLOR_GOOD}; padding: 14px 18px; border-radius: 3px; margin-top: 20px;">
+            <div style="font-size: 12px; font-weight: 600; color: {COLOR_GOOD}; letter-spacing: 1px;">WHY THIS REPLACES RATING COVERAGE AS THE PRIMARY QUALITY MEASUREMENT</div>
+            <div style="font-size: 13px; color: {COLOR_INK}; margin-top: 8px;">
+                Premium customers value time. Asking them to rate the service costs them time — contradicting the brand promise.
+                Operational telemetry measures customer experience directly from signals the operating system already generates,
+                without taxing customer attention. The 17% rating coverage stays useful but smaller; airline-side NPS integration
+                (Q6 wishlist) closes the VIP-experience gap from the partnership side, not the customer-time side.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ============================================================
 # TAB: CHAUFFEUR AUDIT
