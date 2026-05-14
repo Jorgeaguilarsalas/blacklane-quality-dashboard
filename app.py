@@ -59,6 +59,65 @@ TIER_COLORS = {
 }
 
 
+# ============================================================
+# PASSWORD GATE
+# ============================================================
+# Reads password from Streamlit secrets (set in Streamlit Cloud → Settings → Secrets):
+#   APP_PASSWORD = "your-password-here"
+# Falls back to an open dashboard if the secret is not configured.
+
+def check_password() -> bool:
+    """Return True if the user has entered the correct password.
+
+    The password is read from st.secrets["APP_PASSWORD"]. If the secret is
+    not configured, the dashboard runs without a password (open access).
+    Once unlocked, the state persists for the browser session.
+    """
+    # If no password is configured in secrets, run open (current behavior)
+    try:
+        expected_password = st.secrets["APP_PASSWORD"]
+    except (KeyError, FileNotFoundError, Exception):
+        return True  # No password configured → open access
+
+    # Already unlocked this session
+    if st.session_state.get("password_correct", False):
+        return True
+
+    # Render login screen
+    st.markdown(
+        f"""
+        <div style="max-width: 480px; margin: 80px auto 0 auto; padding: 32px;
+                    background: {COLOR_BG}; border: 1px solid #E5E7EB; border-radius: 8px;
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.04);">
+            <div style="font-size: 11px; color: {COLOR_MUTED}; letter-spacing: 2px; font-weight: 600;">BLACKLANE QUALITY DASHBOARD</div>
+            <div style="font-size: 22px; font-weight: 700; color: {COLOR_INK}; margin-top: 8px;">Restricted access</div>
+            <div style="font-size: 13px; color: {COLOR_MUTED}; margin-top: 12px; line-height: 1.5;">
+                This dashboard is shared on request. Please enter the access password provided to you.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Center the input field
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        st.write("")
+        password = st.text_input("Password", type="password", key="password_input", label_visibility="collapsed", placeholder="Enter password")
+        if st.button("Unlock dashboard", type="primary", use_container_width=True):
+            if password == expected_password:
+                st.session_state["password_correct"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password. Please try again.")
+
+    return False
+
+
+if not check_password():
+    st.stop()
+
+
 def value_gradient(value: float, vmin: float, vmax: float, palette: str = "red") -> str:
     """
     Return a CSS background-color style for a numeric value, scaled vmin→vmax.
@@ -319,6 +378,13 @@ def tier_pill(tier: str) -> str:
 with st.sidebar:
     st.markdown(f"<div style='font-size: 20px; font-weight: 700; color: {COLOR_INK}; padding-bottom: 6px;'>BLACKLANE QUALITY</div>", unsafe_allow_html=True)
     st.markdown(f"<div style='font-size: 11px; color: {COLOR_MUTED}; letter-spacing: 1px; text-transform: uppercase; padding-bottom: 18px;'>Q1 2019 EMEA · Dashboard</div>", unsafe_allow_html=True)
+
+    # Logout (only shown if password gate is active)
+    if st.session_state.get("password_correct", False):
+        if st.button("Sign out", use_container_width=False):
+            st.session_state["password_correct"] = False
+            st.rerun()
+        st.markdown("---")
 
     st.subheader("Data")
     uploaded = st.file_uploader("Upload source Excel file", type=["xlsx", "xls"])
